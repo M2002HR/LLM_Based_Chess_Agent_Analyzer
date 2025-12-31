@@ -557,6 +557,26 @@ def require_fields(case: Dict[str, Any], fields: List[str]) -> None:
         raise RuntimeError(f"Missing required fields in case: {missing}")
 
 
+def normalize_methods(case: Dict[str, Any]) -> List[Method]:
+    if "methods" in case:
+        methods = case["methods"]
+        if not isinstance(methods, list) or not methods:
+            raise RuntimeError(f"Invalid methods in case {case.get('case_id')}")
+        out: List[Method] = []
+        for m in methods:
+            ms = str(m)
+            if ms not in ("direct", "cot_hidden", "sc_cot"):
+                raise RuntimeError(f"Invalid method in case {case.get('case_id')}: {ms}")
+            out.append(ms)  # type: ignore[arg-type]
+        return out
+    if "method" in case:
+        ms = str(case["method"])
+        if ms not in ("direct", "cot_hidden", "sc_cot"):
+            raise RuntimeError(f"Invalid method in case {case.get('case_id')}: {ms}")
+        return [ms]  # type: ignore[list-item]
+    raise RuntimeError(f"Case {case.get('case_id')} must include method or methods")
+
+
 def validate_suite(suite: Dict[str, Any]) -> Tuple[str, Dict[str, Any], List[Dict[str, Any]]]:
     suite_id = str(suite.get("suite_id", "suite"))
     defaults = suite.get("defaults", {})
@@ -566,60 +586,67 @@ def validate_suite(suite: Dict[str, Any]) -> Tuple[str, Dict[str, Any], List[Dic
 
     seen = set()
     for c in cases:
-        require_fields(c, ["case_id", "fen", "method"])
+        require_fields(c, ["case_id", "fen"])
         cid = str(c["case_id"])
         if cid in seen:
             raise RuntimeError(f"Duplicate case_id: {cid}")
         seen.add(cid)
 
-        m = c["method"]
-        if m not in ("direct", "cot_hidden", "sc_cot"):
-            raise RuntimeError(f"Invalid method in case {cid}: {m}")
+        _ = normalize_methods(c)
 
-        if c.get("method") == "sc_cot":
-            if "sc_samples" in c and int(c["sc_samples"]) <= 0:
-                raise RuntimeError(f"Invalid sc_samples in case {cid}")
+        if "per_method" in c and not isinstance(c["per_method"], dict):
+            raise RuntimeError(f"per_method must be an object in case {cid}")
+
+        if "sc_samples" in c and int(c["sc_samples"]) <= 0:
+            raise RuntimeError(f"Invalid sc_samples in case {cid}")
 
     return suite_id, defaults, cases
 
 
-def run_case(
+def run_one_method(
     suite_id: str,
+    case_id: str,
+    fen: str,
+    method: Method,
     case: Dict[str, Any],
     defaults: Dict[str, Any],
     keys: List[str],
     results_root: str,
-    suite_key_index: int,
+    start_key_index: int,
     results_dir: str,
     project_root: str,
 ) -> Tuple[Dict[str, Any], int]:
-    case_id = str(case["case_id"])
-    run_dir = os.path.join(results_root, suite_id, case_id)
+    run_dir = os.path.join(results_root, suite_id, case_id, method)
     ensure_dir(run_dir)
 
-    logger = setup_logger(run_dir, name=f"suite_{suite_id}_{case_id}")
+    logger = setup_logger(run_dir, name=f"suite_{suite_id}_{case_id}_{method}")
     cp = DiskCheckpointer(run_dir, logger)
 
-    logger.info("Suite=%s Case=%s", suite_id, case_id)
+    logger.info("Suite=%s Case=%s Method=%s", suite_id, case_id, method)
 
     loaded = cp.load()
     if loaded is not None:
         state: AgentState = loaded
-        logger.info("Loaded existing state. method=%s sc_i=%s key_index=%s", state.get("method"), state.get("sc_i"), state.get("key_index"))
-        start_key_index = int(state.get("key_index", suite_key_index))
+        logger.info("Loaded existing state. sc_i=%s key_index=%s", state.get("sc_i"), state.get("key_index"))
+        start_key_index = int(state.get("key_index", start_key_index))
     else:
-        start_key_index = suite_key_index
         state = {
-            "run_id": case_id,
-            "fen": case.get("fen", chess.STARTING_FEN),
-            "method": case.get("method", defaults.get("method", "direct")),
+            "run_id": f"{case_id}__{method}",
+            "fen": fen,
+            "method": method,
             "sc_samples": int(case.get("sc_samples", defaults.get("sc_samples", 7))),
-            "key_index": start_key_index,
+            "key_index": int(start_key_index),
         }
         cp.save(state)
-        logger.info("Initialized new state. method=%s sc_samples=%s key_index=%s", state.get("method"), state.get("sc_samples"), start_key_index)
+        logger.info("Initialized new state. sc_samples=%s key_index=%s", state.get("sc_samples"), start_key_index)
 
     params = merge_dicts(defaults, case)
+
+    per_method = case.get("per_method", {})
+    if isinstance(per_method, dict) and method in per_method and isinstance(per_method[method], dict):
+        params = merge_dicts(params, per_method[method])
+
+    params["method"] = method
 
     limiter = RateLimiter(min_interval_sec=float(params.get("min_interval_sec", 0.0)))
     km = RoundRobinKeyManager(keys=keys, start_index=start_key_index, logger=logger)
@@ -654,6 +681,7 @@ def run_case(
         meta = {
             "suite_id": suite_id,
             "case_id": case_id,
+            "method": method,
             "started_at": started_at,
             "finished_at": finished_at,
             "run_dir": run_dir,
@@ -666,7 +694,7 @@ def run_case(
     except Exception as e:
         finished_at = now_iso()
         err = repr(e)
-        logger.error("Case failed: %s", err)
+        logger.error("Method run failed: %s", err)
 
         state = cp.load() or state
         state["error"] = err
@@ -676,6 +704,7 @@ def run_case(
         meta = {
             "suite_id": suite_id,
             "case_id": case_id,
+            "method": method,
             "started_at": started_at,
             "finished_at": finished_at,
             "run_dir": run_dir,
@@ -692,15 +721,33 @@ def summarize_suite(summary_items: List[Dict[str, Any]]) -> Dict[str, Any]:
     fail = total - ok
     by_method: Dict[str, int] = {}
     for it in summary_items:
-        m = str(it.get("params", {}).get("method", it.get("result", {}).get("method", "unknown")))
+        m = str(it.get("method", "unknown"))
         by_method[m] = by_method.get(m, 0) + 1
-
     return {
         "total": total,
         "success": ok,
         "failure": fail,
         "by_method": by_method,
     }
+
+
+def write_methods_index(case_root: str, case_id: str, items: List[Dict[str, Any]]) -> None:
+    out = {
+        "case_id": case_id,
+        "generated_at": now_iso(),
+        "methods": [],
+    }
+    for it in items:
+        out["methods"].append(
+            {
+                "method": it.get("method"),
+                "valid": it.get("result", {}).get("valid"),
+                "error": it.get("result", {}).get("error"),
+                "run_dir": it.get("run_dir"),
+                "result_path": os.path.join(str(it.get("run_dir")), "result.json"),
+            }
+        )
+    atomic_write_json(os.path.join(case_root, "methods_index.json"), out)
 
 
 def main() -> None:
@@ -732,26 +779,43 @@ def main() -> None:
     started_at = now_iso()
 
     for idx, case in enumerate(cases, start=1):
-        print(f"[{idx}/{len(cases)}] Running case_id={case['case_id']} (suite_key_index={suite_key_index})")
-        meta, new_key_index = run_case(
-            suite_id=suite_id,
-            case=case,
-            defaults=defaults,
-            keys=keys,
-            results_root=args.results_dir,
-            suite_key_index=suite_key_index,
-            results_dir=args.results_dir,
-            project_root=project_root,
-        )
-        append_jsonl(summary_jsonl, meta)
-        summary_items.append(meta)
+        case_id = str(case["case_id"])
+        fen = str(case["fen"])
+        methods = normalize_methods(case)
 
-        suite_key_index = int(new_key_index) % len(keys)
+        print(f"[{idx}/{len(cases)}] Running case_id={case_id} methods={methods} (suite_key_index={suite_key_index})")
 
-        res = meta.get("result", {})
-        ok = res.get("valid")
-        err = res.get("error")
-        print(f" -> done valid={ok} error={err} next_key_index={suite_key_index}")
+        per_case_items: List[Dict[str, Any]] = []
+        case_root = os.path.join(args.results_dir, suite_id, case_id)
+        ensure_dir(case_root)
+
+        for mi, method in enumerate(methods, start=1):
+            print(f"  - [{mi}/{len(methods)}] method={method} (start_key_index={suite_key_index})")
+            meta, new_key_index = run_one_method(
+                suite_id=suite_id,
+                case_id=case_id,
+                fen=fen,
+                method=method,
+                case=case,
+                defaults=defaults,
+                keys=keys,
+                results_root=args.results_dir,
+                start_key_index=suite_key_index,
+                results_dir=args.results_dir,
+                project_root=project_root,
+            )
+            append_jsonl(summary_jsonl, meta)
+            summary_items.append(meta)
+            per_case_items.append(meta)
+
+            suite_key_index = int(new_key_index) % len(keys)
+
+            res = meta.get("result", {})
+            ok = res.get("valid")
+            err = res.get("error")
+            print(f"    -> done valid={ok} error={err} next_key_index={suite_key_index}")
+
+        write_methods_index(case_root, case_id, per_case_items)
 
     finished_at = now_iso()
     suite_summary = {

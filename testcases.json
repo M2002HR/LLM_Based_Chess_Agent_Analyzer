@@ -1,32 +1,48 @@
 {
-  "suite_id": "suite_001",
+  "suite_id": "suite_combo_001",
   "defaults": {
     "model": "gemini-2.5-flash-lite",
     "temperature": 0.3,
     "retry_on_429": true,
     "max_retries_per_key": 2,
-    "max_key_rotations": 8,
-    "cooloff_sec": 5.0,
-    "max_attempts": 3
+    "cooloff_sec": 30.0,
+    "max_attempts": 3,
+    "sc_samples": 7,
+    "min_interval_sec": 1.0
   },
   "cases": [
     {
-      "case_id": "startpos_direct",
+      "case_id": "easy_startpos",
       "fen": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
-      "method": "direct"
+      "methods": ["direct", "cot_hidden", "sc_cot"],
+      "per_method": {
+        "sc_cot": {
+          "min_interval_sec": 6.3,
+          "sc_samples": 7
+        }
+      }
     },
     {
-      "case_id": "startpos_sc7",
-      "fen": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
-      "method": "sc_cot",
-      "sc_samples": 7,
-      "min_interval_sec": 6.3
+      "case_id": "medium_opening",
+      "fen": "r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3",
+      "methods": ["direct", "cot_hidden", "sc_cot"],
+      "per_method": {
+        "sc_cot": {
+          "min_interval_sec": 6.3,
+          "sc_samples": 7
+        }
+      }
     },
     {
-      "case_id": "pos2_cot",
+      "case_id": "hard_middlegame",
       "fen": "r2q1rk1/pp2bppp/2n1bn2/2pp4/3P4/2P1PN2/PP1NBPPP/R1BQ1RK1 w - - 0 9",
-      "method": "cot_hidden",
-      "min_interval_sec": 1.0
+      "methods": ["direct", "cot_hidden", "sc_cot"],
+      "per_method": {
+        "sc_cot": {
+          "min_interval_sec": 6.3,
+          "sc_samples": 7
+        }
+      }
     }
   ]
 }
