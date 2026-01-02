@@ -38,6 +38,9 @@ class AgentState(TypedDict, total=False):
     raw_model_output: str
     vote_distribution: Dict[str, int]
 
+    repair_attempts: int
+    last_prompt_feedback: str
+
 
 CTX: Dict[str, Any] = {}
 
@@ -251,7 +254,7 @@ def build_prompt(method: Method, fen: str, moves: List[str], feedback: str = "")
     if method in ("cot_hidden", "sc_cot"):
         header = (
             "You are a chess move selector.\n"
-            "Analyze the position internally step-by-step to choose the best move.\n"
+            "Analyze internally step-by-step to choose the best move.\n"
             "Do NOT reveal your reasoning.\n"
         )
     else:
@@ -261,11 +264,12 @@ def build_prompt(method: Method, fen: str, moves: List[str], feedback: str = "")
         header
         + "You MUST select exactly one move from the provided legal moves list.\n"
         + "Return ONLY valid JSON with this schema: {\"move_uci\": \"...\"}\n"
-        + "No extra keys. No markdown. No prose.\n\n"
+        + "No extra keys. No markdown. No prose.\n"
+        + "If you output any move not in LEGAL_MOVES_UCI, your answer will be rejected.\n\n"
         + f"FEN: {fen}\n"
         + f"LEGAL_MOVES_UCI: {moves_str}\n"
     )
-    return base + ("\n" + feedback + "\n" if feedback else "")
+    return base + ("\nFEEDBACK:\n" + feedback + "\n" if feedback else "")
 
 
 def llm_call_round_robin(prompt: str) -> str:
@@ -331,6 +335,18 @@ def llm_call_round_robin(prompt: str) -> str:
                     rounds_done = 0
 
 
+def is_repairable_error(err: str) -> bool:
+    s = (err or "").lower()
+    repairable_markers = [
+        "no valid samples produced",
+        "did not return a valid move",
+        "illegal",
+        "not valid",
+        "invalid",
+    ]
+    return any(m in s for m in repairable_markers)
+
+
 def node_get_legal_moves(state: AgentState) -> AgentState:
     cfg = get_ctx()
     logger: logging.Logger = cfg["logger"]
@@ -351,6 +367,8 @@ def node_init_sc(state: AgentState) -> AgentState:
 
     logger.info("NODE init_sc")
     cp.event({"node": "init_sc", "ts": time.time()})
+
+    state.setdefault("repair_attempts", 0)
 
     if state.get("method") == "sc_cot":
         state.setdefault("sc_votes", [])
@@ -511,6 +529,63 @@ def node_validate_apply(state: AgentState) -> AgentState:
     return state
 
 
+def node_repair_move(state: AgentState) -> AgentState:
+    cfg = get_ctx()
+    logger: logging.Logger = cfg["logger"]
+    cp: DiskCheckpointer = cfg["cp"]
+
+    logger.info("NODE repair_move")
+    cp.event({"node": "repair_move", "ts": time.time(), "key_index": cfg["keyman"].index})
+
+    attempts = int(state.get("repair_attempts", 0)) + 1
+    state["repair_attempts"] = attempts
+
+    fen = state["fen"]
+    moves = state["legal_moves"]
+
+    prev_err = ""
+    if "error" in state:
+        prev_err = str(state.get("error", ""))
+    else:
+        res = state.get("result") or {}
+        prev_err = str(res.get("error", ""))
+
+    prev_raw = str(state.get("raw_model_output", ""))
+    prev_move = str(state.get("move_uci", ""))
+
+    feedback = (
+        "Your previous output was invalid.\n"
+        f"Error: {prev_err}\n"
+        f"Previous move_uci: {prev_move}\n"
+        f"Previous raw: {prev_raw}\n"
+        "You MUST return exactly one move_uci from LEGAL_MOVES_UCI.\n"
+        "Do not repeat the same invalid move.\n"
+    )
+    state["last_prompt_feedback"] = feedback
+
+    repair_method: Method = "cot_hidden"
+    raw = llm_call_round_robin(build_prompt(repair_method, fen, moves, feedback=feedback))
+    state["raw_model_output"] = raw
+
+    mv = parse_move_from_raw(raw)
+    if mv is None or mv not in moves:
+        state["error"] = "Repair failed to produce a valid move from legal moves."
+        state["key_index"] = cfg["keyman"].index
+        cp.save(state)
+        return state
+
+    if "error" in state:
+        del state["error"]
+    if "result" in state:
+        del state["result"]
+
+    state["move_uci"] = mv
+    state["method"] = state.get("method", "direct")
+    state["key_index"] = cfg["keyman"].index
+    cp.save(state)
+    return state
+
+
 def route_after_init(state: AgentState) -> str:
     if state.get("method") == "sc_cot":
         return "sc_step"
@@ -525,6 +600,26 @@ def route_sc_loop(state: AgentState) -> str:
     return "choose_move"
 
 
+def route_after_validate(state: AgentState) -> str:
+    max_repairs = int(get_ctx().get("max_repairs", 1))
+    attempts = int(state.get("repair_attempts", 0))
+
+    res = state.get("result") or {}
+    valid = res.get("valid")
+    err = str(res.get("error", "")) if res else ""
+
+    if valid is True:
+        return "end"
+
+    if attempts >= max_repairs:
+        return "end"
+
+    if is_repairable_error(err) or ("error" in state and is_repairable_error(str(state.get("error", "")))):
+        return "repair_move"
+
+    return "end"
+
+
 def build_graph():
     g = StateGraph(AgentState)
     g.add_node("get_legal_moves", node_get_legal_moves)
@@ -532,13 +627,20 @@ def build_graph():
     g.add_node("sc_step", node_sc_step)
     g.add_node("choose_move", node_choose_move)
     g.add_node("validate_apply", node_validate_apply)
+    g.add_node("repair_move", node_repair_move)
 
     g.set_entry_point("get_legal_moves")
     g.add_edge("get_legal_moves", "init_sc")
     g.add_conditional_edges("init_sc", route_after_init, {"sc_step": "sc_step", "choose_move": "choose_move"})
     g.add_conditional_edges("sc_step", route_sc_loop, {"sc_step": "sc_step", "choose_move": "choose_move"})
     g.add_edge("choose_move", "validate_apply")
-    g.add_edge("validate_apply", END)
+
+    g.add_conditional_edges(
+        "validate_apply",
+        route_after_validate,
+        {"repair_move": "repair_move", "end": END},
+    )
+    g.add_edge("repair_move", "validate_apply")
 
     return g.compile()
 
@@ -636,6 +738,7 @@ def run_one_method(
             "method": method,
             "sc_samples": int(case.get("sc_samples", defaults.get("sc_samples", 7))),
             "key_index": int(start_key_index),
+            "repair_attempts": 0,
         }
         cp.save(state)
         logger.info("Initialized new state. sc_samples=%s key_index=%s", state.get("sc_samples"), start_key_index)
@@ -660,6 +763,7 @@ def run_one_method(
         "rounds_limit": int(params.get("max_retries_per_key", 2)),
         "cooloff_sec": float(params.get("cooloff_sec", 60.0)),
         "max_attempts": int(params.get("max_attempts", 3)),
+        "max_repairs": int(params.get("max_repairs", 1)),
         "model": str(params.get("model", "gemini-2.5-flash-lite")),
         "temperature": float(params.get("temperature", 0.3)),
         "results_dir": results_dir,
