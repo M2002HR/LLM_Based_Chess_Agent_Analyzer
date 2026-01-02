@@ -7,7 +7,6 @@ from collections import Counter
 from typing import Any, Dict, List, Literal, Optional, TypedDict, Tuple
 
 from dotenv import load_dotenv
-import chess
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_google_genai.chat_models import ChatGoogleGenerativeAIError
 from langgraph.graph import StateGraph, END
@@ -620,6 +619,47 @@ def route_after_validate(state: AgentState) -> str:
     return "end"
 
 
+def save_langgraph_diagram(app: Any, out_png_path: str, out_mmd_path: Optional[str] = None) -> None:
+    """
+    Save a nice LangGraph diagram as PNG (and optionally Mermaid .mmd source).
+    PNG is ideal for Word reports.
+    """
+    g = app.get_graph()
+
+    mermaid: Optional[str] = None
+    try:
+        mermaid = g.draw_mermaid()
+        if out_mmd_path:
+            ensure_dir(os.path.dirname(out_mmd_path))
+            with open(out_mmd_path, "w", encoding="utf-8") as f:
+                f.write(mermaid)
+    except Exception:
+        mermaid = None
+
+    ensure_dir(os.path.dirname(out_png_path))
+
+    try:
+        png_bytes = g.draw_mermaid_png()
+        with open(out_png_path, "wb") as f:
+            f.write(png_bytes)
+        return
+    except TypeError:
+        try:
+            png_bytes = g.draw_mermaid_png(draw_method="api")
+            with open(out_png_path, "wb") as f:
+                f.write(png_bytes)
+            return
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    if mermaid and out_mmd_path:
+        return
+
+    raise RuntimeError("Failed to render LangGraph diagram (PNG). Mermaid renderer not available.")
+
+
 def build_graph():
     g = StateGraph(AgentState)
     g.add_node("get_legal_moves", node_get_legal_moves)
@@ -773,6 +813,19 @@ def run_one_method(
 
     set_ctx(cfg)
     app = build_graph()
+
+    try:
+        suite_graph_png = os.path.join(results_dir, suite_id, "graph.png")
+        suite_graph_mmd = os.path.join(results_dir, suite_id, "graph.mmd")
+        save_langgraph_diagram(app, suite_graph_png, suite_graph_mmd)
+
+        run_graph_png = os.path.join(run_dir, "graph.png")
+        run_graph_mmd = os.path.join(run_dir, "graph.mmd")
+        save_langgraph_diagram(app, run_graph_png, run_graph_mmd)
+
+        logger.info("Saved LangGraph diagram: %s", suite_graph_png)
+    except Exception as e:
+        logger.warning("Could not save LangGraph diagram: %s", repr(e))
 
     started_at = now_iso()
     try:
