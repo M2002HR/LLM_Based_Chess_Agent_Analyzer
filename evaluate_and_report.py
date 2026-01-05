@@ -509,7 +509,6 @@ def build_case_report_image(
         boards_y0 = row_y0 + info_bar_h
         boards_y1 = boards_y0 + cell_h
 
-        # info bar background
         draw.rectangle((0, info_y0, width, info_y0 + info_bar_h), fill=(245, 247, 250, 255))
         draw.line((0, info_y0, width, info_y0), fill=grid, width=2)
         draw.line((0, boards_y0, width, boards_y0), fill=grid, width=2)
@@ -561,7 +560,6 @@ def build_case_report_image(
             if eval_sleep_ms > 0:
                 time.sleep(eval_sleep_ms / 1000.0)
 
-        # left info
         pad = 22
         left_x = pad
         top_y = info_y0 + 18
@@ -577,11 +575,9 @@ def build_case_report_image(
                 draw.text((left_x, yy), ln, font=font_small, fill=(120, 0, 0, 255))
                 yy += 34
 
-        # divider
         divider_x = int(width * 0.62)
         draw.line((divider_x, info_y0 + 12, divider_x, info_y0 + info_bar_h - 12), fill=(0, 0, 0, 60), width=2)
 
-        # right info (wrapped to never overflow)
         right_x = divider_x + 18
         right_pad_r = pad
         right_w = width - right_x - right_pad_r
